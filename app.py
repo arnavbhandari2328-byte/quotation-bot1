@@ -6,19 +6,20 @@ import datetime
 from flask import Flask, request, Response, jsonify
 import requests
 
-# --------- ENV ---------
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# ---------- ENV VARS ----------
+GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY")
+
 META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN")
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
+PHONE_NUMBER_ID   = os.environ.get("PHONE_NUMBER_ID")
 META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN")
 
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY")              # required on Render
-RESEND_FROM    = os.environ.get("RESEND_FROM",                 # you asked to use your Gmail here
-                                "Nivee Metal <arnavbhandari2328@gmail.com>")
+SENDGRID_API_KEY  = os.environ.get("SENDGRID_API_KEY")
+FROM_EMAIL        = os.environ.get("FROM_EMAIL", "arnavbhandari2328@gmail.com")
+FROM_NAME         = os.environ.get("FROM_NAME",  "Nivee Metal Products Pvt. Ltd.")
 
 TEMPLATE_FILE = "Template.docx"
 
-# --------- APP ---------
+# ---------- FLASK APP ----------
 app = Flask(__name__)
 
 @app.get("/")
@@ -33,20 +34,27 @@ def health():
         "META_ACCESS_TOKEN": META_ACCESS_TOKEN,
         "PHONE_NUMBER_ID": PHONE_NUMBER_ID,
         "META_VERIFY_TOKEN": META_VERIFY_TOKEN,
-        "RESEND_API_KEY": RESEND_API_KEY
+        "SENDGRID_API_KEY": SENDGRID_API_KEY,
+        "FROM_EMAIL": FROM_EMAIL,
     }.items() if not v]
     return jsonify(ok=len(missing) == 0, missing=missing)
 
-# --------- WHATSAPP SEND ---------
-def send_whatsapp_reply(to_phone_number, message_text):
+# ---------- WHATSAPP SEND ----------
+def send_whatsapp_reply(to_phone_number: str, message_text: str) -> None:
     if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
-        print("!!! ERROR: Meta API keys missing. Cannot send reply.")
+        print("!!! ERROR: Meta API keys missing; cannot send reply.")
         return
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}",
-               "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": to_phone_number,
-               "type": "text", "text": {"body": message_text}}
+    headers = {
+        "Authorization": f"Bearer {META_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone_number,
+        "type": "text",
+        "text": {"body": message_text}
+    }
     resp = None
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=20)
@@ -55,10 +63,10 @@ def send_whatsapp_reply(to_phone_number, message_text):
     except requests.exceptions.RequestException as e:
         print(f"!!! WhatsApp send error: {e}")
         if resp is not None:
-            print(f"Status {resp.status_code} Body {resp.text}")
+            print(f"Status {resp.status_code} Body: {resp.text}")
 
-# --------- AI PARSE (lazy Gemini) ---------
-def parse_command_with_ai(command_text):
+# ---------- AI PARSE (Gemini; lazy import) ----------
+def parse_command_with_ai(command_text: str):
     print("Sending command to Google AI (Gemini) for parsing...")
     try:
         import google.generativeai as genai  # lazy import
@@ -69,6 +77,7 @@ def parse_command_with_ai(command_text):
 
         model = genai.GenerativeModel('models/gemini-pro-latest')
         today = datetime.date.today().strftime('%B %d, %Y')
+
         system_prompt = f"""
         You are an assistant for a stainless steel trader. Extract a quotation.
 
@@ -92,21 +101,22 @@ def parse_command_with_ai(command_text):
         User: "quote 101 for Raju at Raj pvt ltd, 500 pcs 3in pipe at 600, hsn 7304, email raju@gmail.com"
         AI: {{"q_no":"101","date":"{today}","company_name":"Raj pvt ltd","customer_name":"Raju","product":"3in pipe","quantity":"500","rate":"600","units":"Pcs","hsn":"7304","email":"raju@gmail.com"}}
         """
+
         response = model.generate_content(system_prompt + "\n\nUser: " + command_text)
         ai_text = (response.text or "").strip().replace("```json", "").replace("```", "").strip()
         print(f"AI response received: {ai_text}")
 
         context = json.loads(ai_text)
 
-        # required fields
+        # Required fields
         for f in ['product', 'customer_name', 'email', 'rate', 'quantity']:
             if not str(context.get(f, "")).strip():
                 print(f"!!! ERROR: Missing field {f}")
                 return None
 
-        # numbers
+        # Numbers & totals
         try:
-            qty = int(re.sub(r"[^\d]", "", str(context['quantity'])))
+            qty  = int(re.sub(r"[^\d]", "", str(context['quantity'])))
             rate = float(str(context['rate']).replace(",", "").strip())
             total = qty * rate
             context['quantity'] = str(qty)
@@ -117,7 +127,7 @@ def parse_command_with_ai(command_text):
             print("!!! ERROR: Invalid rate/quantity.")
             return None
 
-        # defaults
+        # Defaults
         context.setdefault('date', today)
         context.setdefault('company_name', "")
         context.setdefault('hsn', "")
@@ -126,25 +136,27 @@ def parse_command_with_ai(command_text):
 
         print(f"Parsed context: {context}")
         return context
+
     except Exception as e:
         print(f"!!! AI error: {e}")
         return None
     finally:
         gc.collect()
 
-# --------- DOCX (lazy docxtpl) ---------
-def create_quotation_from_template(context):
+# ---------- DOCX GENERATION (docxtpl; lazy import) ----------
+def create_quotation_from_template(context) -> str | None:
     doc = None
     try:
         from docxtpl import DocxTemplate  # lazy import
+
         script_dir = os.path.dirname(os.path.abspath(__file__))
         template_path = os.path.join(script_dir, TEMPLATE_FILE)
         doc = DocxTemplate(template_path)
         doc.render(context)
 
-        safe_name = "".join(c for c in context['customer_name'] if c.isalnum() or c in " _-").rstrip()
-        filename = f"Quotation_{safe_name}_{datetime.date.today()}.docx"
-        out_path = os.path.join("/tmp", filename)  # Render-friendly tmp
+        safe = "".join(c for c in context['customer_name'] if c.isalnum() or c in " _-").rstrip()
+        filename = f"Quotation_{safe}_{datetime.date.today()}.docx"
+        out_path = os.path.join("/tmp", filename)  # Render-safe temp dir
         doc.save(out_path)
         print(f"✅ DOCX created: '{out_path}'")
         return out_path
@@ -158,13 +170,17 @@ def create_quotation_from_template(context):
             pass
         gc.collect()
 
-# --------- EMAIL (Resend HTTP API) ---------
-def send_email_with_attachment(recipient_email, subject, body, attachment_path):
+# ---------- EMAIL (SendGrid HTTP API) ----------
+def send_email_with_attachment(recipient_email: str, subject: str, body: str, attachment_path: str) -> bool:
+    """
+    Send via SendGrid so we can use Gmail as the From on Render Free (HTTPS, not SMTP).
+    Env required: SENDGRID_API_KEY, FROM_EMAIL, FROM_NAME
+    """
     if not attachment_path:
-        print("No attachment path; aborting email.")
+        print("No attachment; aborting email.")
         return False
-    if not RESEND_API_KEY:
-        print("No RESEND_API_KEY; aborting email.")
+    if not SENDGRID_API_KEY:
+        print("SENDGRID_API_KEY missing.")
         return False
 
     try:
@@ -173,23 +189,31 @@ def send_email_with_attachment(recipient_email, subject, body, attachment_path):
             encoded = base64.b64encode(f.read()).decode("utf-8")
 
         payload = {
-            "from": RESEND_FROM,                         # shows your Gmail as sender
-            "reply_to": "arnavbhandari2328@gmail.com",   # replies go to your Gmail
-            "to": [recipient_email],
-            "subject": subject,
-            "text": body,
+            "personalizations": [{
+                "to": [{"email": recipient_email}],
+                "subject": subject
+            }],
+            "from": {"email": FROM_EMAIL, "name": FROM_NAME},
+            "reply_to": {"email": FROM_EMAIL, "name": FROM_NAME},
+            "content": [{"type": "text/plain", "value": body}],
             "attachments": [{
-                "filename": os.path.basename(attachment_path),
                 "content": encoded,
-                "type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                "type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "filename": os.path.basename(attachment_path),
+                "disposition": "attachment"
             }]
         }
-        headers = {"Authorization": f"Bearer {RESEND_API_KEY}",
-                   "Content-Type": "application/json"}
 
-        resp = requests.post("https://api.resend.com/emails", headers=headers, json=payload, timeout=30)
+        headers = {
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        resp = requests.post("https://api.sendgrid.com/v3/mail/send",
+                             headers=headers, json=payload, timeout=30)
+
         if 200 <= resp.status_code < 300:
-            print(f"✅ Email sent to {recipient_email}")
+            print(f"✅ Email sent via SendGrid to {recipient_email}")
             try:
                 os.remove(attachment_path)
                 print(f"🧹 Deleted temp file {attachment_path}")
@@ -198,15 +222,14 @@ def send_email_with_attachment(recipient_email, subject, body, attachment_path):
             gc.collect()
             return True
         else:
-            print(f"❌ Resend error {resp.status_code}: {resp.text}")
-            # Note: If you see 403 validation_error, verify a domain in Resend or
-            # send only to your own mailbox while testing.
+            print(f"❌ SendGrid error {resp.status_code}: {resp.text}")
             return False
+
     except Exception as e:
         print(f"Email exception: {e}")
         return False
 
-# --------- WEBHOOK ---------
+# ---------- WEBHOOK ----------
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
@@ -296,9 +319,9 @@ Nivee Metal Products Pvt. Ltd.
     gc.collect()
     return Response(status=200)
 
-# --------- LOCAL RUN (Render uses Gunicorn) ---------
+# ---------- LOCAL RUN (Render uses Gunicorn) ----------
 if __name__ == "__main__":
-    if not all([GEMINI_API_KEY, META_ACCESS_TOKEN, PHONE_NUMBER_ID, META_VERIFY_TOKEN, RESEND_API_KEY]):
+    if not all([GEMINI_API_KEY, META_ACCESS_TOKEN, PHONE_NUMBER_ID, META_VERIFY_TOKEN, SENDGRID_API_KEY]):
         print("!!! WARNING: one or more env vars are missing.")
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting Flask on 0.0.0.0:{port}")
